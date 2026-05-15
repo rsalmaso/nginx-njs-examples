@@ -105,8 +105,471 @@ Checking:
   curl http://localhost/version
   0.4.1
 
+Access phase (``js_access``)
+----------------------------
+
+.. note:: The examples in this section require njs
+   `0.9.9 <https://nginx.org/en/docs/njs/changes.html#njs0.9.9>`_ or later.
+
+The `js_access <https://nginx.org/en/docs/http/ngx_http_js_module.html#js_access>`_
+directive registers a JavaScript handler in the
+`access phase <https://nginx.org/en/docs/dev/development_guide.html#http_phases>`_,
+running after built-in access checkers (``allow``/``deny``, ``auth_basic``,
+``auth_request``) and before the content phase. It supports asynchronous
+operations (``ngx.fetch()``, ``r.subrequest()``, ``setTimeout()``) and the
+new request-body readers (``r.readRequestText()``, ``r.readRequestJSON()``,
+``r.readRequestArrayBuffer()``, ``r.readRequestForm()``).
+
+Signed requests with body inspection [http/access/auth_signature_body]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Validates an HMAC signature over the request URI plus arguments (GET) or
+URI plus body (POST), denying the request before it reaches the upstream.
+This replaces the `Authorizing requests based on request body content`_
+example: the request body is read with ``r.readRequestText()`` directly in
+the access phase, then ``proxy_pass`` forwards the unmodified body to the
+backend. No internal redirect, no ``@app-backend`` named location.
+
+nginx.conf:
+
+.. code-block:: nginx
+
+    load_module modules/ngx_http_js_module.so;
+
+    events {  }
+
+    env SECRET_KEY;
+
+    http {
+        js_path "/etc/nginx/njs/";
+
+        js_import main from http/access/auth_signature_body.js;
+
+        upstream backend {
+            server 127.0.0.1:8081;
+        }
+
+        server {
+            listen 80;
+
+            location /secure/ {
+                js_access main.authorize;
+                proxy_pass http://backend;
+            }
+        }
+
+        server {
+            listen 127.0.0.1:8081;
+
+            location / {
+                js_content main.echo_body;
+            }
+        }
+    }
+
+example.js:
+
+.. code-block:: js
+
+    import crypto from 'crypto';
+
+    async function authorize(r) {
+        let signature = r.headersIn.Signature;
+
+        if (!signature) {
+            r.return(401, "No signature\n");
+            return;
+        }
+
+        let h = crypto.createHmac('sha1', process.env.SECRET_KEY);
+        h.update(r.uri);
+
+        switch (r.method) {
+        case 'GET':
+            h.update(r.variables.args || "");
+            break;
+
+        case 'POST':
+            if (r.headersIn['Content-Type'] != 'application/x-www-form-urlencoded') {
+                r.return(401, "Unsupported content type\n");
+                return;
+            }
+
+            h.update(await r.readRequestText());
+            break;
+
+        default:
+            r.return(401, "Unsupported method\n");
+            return;
+        }
+
+        let req_sig = h.digest("base64");
+
+        if (req_sig != signature) {
+            r.return(401, `Invalid signature: ${req_sig}\n`);
+            return;
+        }
+    }
+
+    async function echo_body(r) {
+        let body = (r.method === 'POST') ? await r.readRequestText() : '';
+        r.return(200, `BACKEND:${r.method}:${r.variables.request_uri}:${body}\n`);
+    }
+
+    export default {authorize, echo_body}
+
+Checking:
+
+.. code-block:: shell
+
+    docker run --rm --name njs_example -e SECRET_KEY="foo" ...
+
+    curl http://localhost/secure/B
+    No signature
+
+    curl "http://localhost/secure/B?a=1" -H 'Signature:bogus'
+    Invalid signature: YC5iL6aKDnv7XOjknEeDL+P58iw=
+
+    SIG=$(printf '%s' '/secure/Ba=1' | openssl dgst -sha1 -hmac foo -binary | base64)
+    curl "http://localhost/secure/B?a=1" -H "Signature:$SIG"
+    BACKEND:GET:/secure/B?a=1:
+
+    # Body is forwarded to the backend unchanged.
+    curl http://localhost/secure/B -X POST -d "a=1" -H "Signature:$SIG"
+    BACKEND:POST:/secure/B:a=1
+
+External-service authorization [http/access/auth_remote_service]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Validates a bearer-style token against an external introspection service via
+``ngx.fetch()`` and forwards the resolved user identity to the backend through
+``proxy_set_header``. Unauthenticated requests are redirected to an identity
+provider with ``r.return(302, url)`` - a flow that is only possible because
+``js_access`` runs in the access phase. Replaces the
+`Authorizing requests using auth_request [http/authorization/auth_request]`_
+pattern of an ``auth_request`` subrequest plus an internal ``js_content``.
+
+nginx.conf:
+
+.. code-block:: nginx
+
+    load_module modules/ngx_http_js_module.so;
+
+    events {  }
+
+    http {
+        js_path "/etc/nginx/njs/";
+
+        js_import main from http/access/auth_remote_service.js;
+
+        js_var $user;
+
+        server {
+            listen 80;
+
+            location /protected/ {
+                js_access main.auth;
+
+                proxy_set_header X-User $user;
+                proxy_pass http://127.0.0.1:8081;
+            }
+        }
+
+        server {
+            listen 127.0.0.1:8079;
+
+            location /introspect {
+                js_content main.introspect;
+            }
+        }
+
+        server {
+            listen 127.0.0.1:8081;
+
+            location / {
+                js_content main.whoami;
+            }
+        }
+    }
+
+example.js:
+
+.. code-block:: js
+
+    const IDP_LOGIN_URL = 'https://idp.example.com/login?rd=';
+
+    async function auth(r) {
+        let token = r.args.token;
+
+        if (!token) {
+            r.return(302, IDP_LOGIN_URL + encodeURIComponent(r.variables.request_uri));
+            return;
+        }
+
+        let reply = await ngx.fetch('http://127.0.0.1:8079/introspect',
+                                    {body: token});
+
+        if (reply.status == 200) {
+            r.variables.user = await reply.text();
+            return;
+        }
+
+        if (reply.status == 401 || reply.status == 403) {
+            r.return(reply.status, "Access denied\n");
+            return;
+        }
+
+        r.return(502, "Auth service unavailable\n");
+    }
+
+    function introspect(r) {
+        let users = { 't-alice': 'alice', 't-bob': 'bob' };
+        let user = users[r.requestText];
+
+        if (user) {
+            r.return(200, user);
+        } else {
+            r.return(403);
+        }
+    }
+
+    function whoami(r) {
+        r.return(200, `Hello ${r.headersIn['X-User'] || 'anon'}\n`);
+    }
+
+    export default {auth, introspect, whoami}
+
+Checking:
+
+.. code-block:: shell
+
+    # No token: redirect to the identity provider.
+    curl -si http://localhost/protected/page | head -2
+    HTTP/1.1 302 Moved Temporarily
+    Location: https://idp.example.com/login?rd=%2Fprotected%2Fpage
+
+    # Invalid token: introspection returns 403, the request is denied.
+    curl http://localhost/protected/page?token=bogus
+    Access denied
+
+    # Valid token: backend sees X-User: alice.
+    curl http://localhost/protected/page?token=t-alice
+    Hello alice
+
+    curl http://localhost/protected/page?token=t-bob
+    Hello bob
+
+Dynamic upstream selection from form data [http/access/route_by_form]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Routes a request to a different upstream based on a ``region`` form field
+parsed by ``r.readRequestForm()``. The handler also rejects requests with
+file parts using ``form.hasFiles()``, demonstrating an edge-side filter
+against unwanted uploads. The same handler accepts both
+``application/x-www-form-urlencoded`` and ``multipart/form-data``.
+This pattern supersedes the `Setting nginx var as a result of async operation`_
+workarounds (``auth_request`` + ``js_header_filter`` to populate a variable):
+``js_access`` lets the handler set ``r.variables.upstream`` directly.
+
+nginx.conf:
+
+.. code-block:: nginx
+
+    load_module modules/ngx_http_js_module.so;
+
+    events {  }
+
+    http {
+        js_path "/etc/nginx/njs/";
+
+        js_import main from http/access/route_by_form.js;
+
+        js_var $upstream;
+
+        server {
+            listen 80;
+
+            location /submit {
+                js_access main.route;
+                proxy_pass http://$upstream;
+            }
+        }
+
+        server {
+            listen 127.0.0.1:8081;
+            location / { js_content main.echo; }
+        }
+
+        server {
+            listen 127.0.0.1:8082;
+            location / { js_content main.echo; }
+        }
+    }
+
+example.js:
+
+.. code-block:: js
+
+    const backends = {
+        us: '127.0.0.1:8081',
+        eu: '127.0.0.1:8082',
+    };
+
+    async function route(r) {
+        let form = await r.readRequestForm({maxKeys: 16});
+
+        if (form.hasFiles()) {
+            r.return(403, "file uploads not allowed\n");
+            return;
+        }
+
+        let region = form.get('region');
+        let upstream = backends[region];
+
+        if (!upstream) {
+            r.return(400, `unknown region: ${region}\n`);
+            return;
+        }
+
+        r.variables.upstream = upstream;
+    }
+
+    function echo(r) {
+        r.return(200, `BACKEND ${r.variables.server_port}:${r.uri}\n`);
+    }
+
+    export default {route, echo}
+
+Checking:
+
+.. code-block:: shell
+
+    # urlencoded form, routed by region.
+    curl http://localhost/submit -d 'region=us'
+    BACKEND 8081:/submit
+
+    curl http://localhost/submit -d 'region=eu'
+    BACKEND 8082:/submit
+
+    # multipart/form-data also works.
+    curl http://localhost/submit -F 'region=us' -F 'payload=qux'
+    BACKEND 8081:/submit
+
+    # Unknown region: 400.
+    curl http://localhost/submit -d 'region=ap'
+    unknown region: ap
+
+    # File upload: rejected at the edge without buffering the file.
+    echo hello > /tmp/f.txt
+    curl http://localhost/submit -F 'region=us' -F 'attachment=@/tmp/f.txt'
+    file uploads not allowed
+
+Per-key rate limit with a shared dict [http/access/rate_limit_per_key]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Rejects requests above a fixed-window quota per bearer token, using a
+`js_shared_dict_zone <https://nginx.org/en/docs/http/ngx_http_js_module.html#js_shared_dict_zone>`_
+of type ``number`` with a TTL. The handler atomically increments a counter
+keyed by the token (``ngx.shared.<zone>.incr(key, 1, 0, ttl_ms)``) and
+denies with ``429 Too Many Requests`` plus a ``Retry-After`` header once the
+quota is exceeded. The whole gate is in-process: no external store, no
+``auth_request``, no ``limit_req_zone`` per key.
+
+nginx.conf:
+
+.. code-block:: nginx
+
+    load_module modules/ngx_http_js_module.so;
+
+    events {  }
+
+    http {
+        js_path "/etc/nginx/njs/";
+
+        js_import main from http/access/rate_limit_per_key.js;
+
+        js_shared_dict_zone zone=quota:1m type=number timeout=10s;
+
+        server {
+            listen 80;
+
+            location /api/ {
+                js_access main.rate_limit;
+                proxy_pass http://127.0.0.1:8081;
+            }
+        }
+
+        server {
+            listen 127.0.0.1:8081;
+
+            location / {
+                js_content main.whoami;
+            }
+        }
+    }
+
+example.js:
+
+.. code-block:: js
+
+    const LIMIT = 5;
+    const WINDOW_MS = 10000;
+
+    function rate_limit(r) {
+        let m = (r.headersIn.Authorization || '').match(/^Bearer (\S+)/);
+        if (!m) {
+            r.return(401, "missing bearer token\n");
+            return;
+        }
+
+        let n = ngx.shared.quota.incr(m[1], 1, 0, WINDOW_MS);
+
+        if (n > LIMIT) {
+            r.headersOut['Retry-After'] = Math.ceil(WINDOW_MS / 1000);
+            r.return(429, `rate limit exceeded (${n}/${LIMIT})\n`);
+        }
+    }
+
+    function whoami(r) {
+        let token = r.headersIn.Authorization.match(/^Bearer (\S+)/)[1];
+        r.return(200, `welcome ${token}\n`);
+    }
+
+    export default {rate_limit, whoami}
+
+Checking:
+
+.. code-block:: shell
+
+    # No bearer token: 401.
+    curl http://localhost/api/foo
+    missing bearer token
+
+    # First 5 requests for alice succeed.
+    for i in 1 2 3 4 5; do
+        curl http://localhost/api/foo -H 'Authorization: Bearer alice'
+    done
+    welcome alice
+    welcome alice
+    welcome alice
+    welcome alice
+    welcome alice
+
+    # 6th hits the limit and returns Retry-After.
+    curl -si http://localhost/api/foo -H 'Authorization: Bearer alice' | head -7
+    HTTP/1.1 429 Too Many Requests
+    ...
+    Retry-After: 10
+    ...
+    rate limit exceeded (6/5)
+
+    # bob has an independent counter.
+    curl http://localhost/api/foo -H 'Authorization: Bearer bob'
+    welcome bob
+
 Setting nginx var as a result of async operation
 ------------------------------------------------
+
 `js_set <https://nginx.org/en/docs/http/ngx_http_js_module.html#js_set>`_ handler
 does not support asynchronous operation (r.subrequest(), ngx.fetch()) because it is
 invoked in a synchronous context by nginx and is expected to return its result
@@ -535,6 +998,12 @@ Authorizing requests using auth_request [http/authorization/auth_request]
 
 .. _`auth request`:
 
+.. note:: Since njs 0.9.9 the same flow can be expressed with a single
+   ``js_access`` handler that calls the auth service via ``ngx.fetch()`` or
+   ``r.subrequest()``, removing the need for a separate internal location
+   and ``auth_request`` directive; see
+   `External-service authorization [http/access/auth_remote_service]`_.
+
 `auth_request <http://nginx.org/en/docs/http/ngx_http_auth_request_module.html>`_
 is generic nginx modules which implements client authorization based on the result of a subrequest.
 Combination of auth_request and njs allows to implement arbitrary authorization logic.
@@ -656,6 +1125,13 @@ Checking:
 
 Authorizing requests based on request body content [http/authorization/request_body]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note:: Since njs 0.9.9 the request body can be read directly in the
+   access phase with ``r.readRequestText()``, removing the need for a
+   ``js_content`` handler and the ``r.internalRedirect('@app-backend')``
+   trampoline; see
+   `Signed requests with body inspection [http/access/auth_signature_body]`_.
+
 `Authorizing requests using auth_request [http/authorization/auth_request]`_ cannot inspect client request body.
 Sometimes inspecting client request body is required, for example to validate POST arguments (application/x-www-form-urlencoded).
 
@@ -1360,6 +1836,11 @@ Shared Dictionary
 
 HTTP Rate limit[http/rate-limit/simple]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note:: Since njs 0.9.9 the same gate can be implemented as a single
+   ``js_access`` handler using ``ngx.shared.<zone>.incr()``, replacing the
+   ``js_set`` + ``if`` + ``return 429`` chain below; see
+   `Per-key rate limit with a shared dict [http/access/rate_limit_per_key]`_.
 
 In this example `js_shared_dict_zone <https://nginx.org/en/docs/http/ngx_http_js_module.html#js_shared_dict_zone>`_ is used to implement a simple rate limit and can be set in different contexts.
 The rate limit is implemented using a shared dictionary zone and a simple javascript function that is called for each request and increments the counter for the current window.
