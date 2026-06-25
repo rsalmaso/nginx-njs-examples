@@ -10,7 +10,7 @@ Intro
 
 This repo contains complete examples for various use cases where `njs <http://nginx.org/en/docs/njs/>`_ is useful. The document as well as `njs documentation <http://nginx.org/en/docs/njs/>`_ expects some familiarity with and understanding of nginx. Beginners should refer to the official `admin guide <https://docs.nginx.com/nginx/admin-guide/>`_.
 
-Note: the examples below work with njs >= `0.7.0 <http://nginx.org/en/docs/njs/changes.html#njs0.7.0>`_. To see the current version run the following command: ``docker run -i -t nginx:latest /usr/bin/njs -V``.
+Note: most examples below work with njs >= `0.7.0 <http://nginx.org/en/docs/njs/changes.html#njs0.7.0>`_; examples that rely on newer features state their minimum version. To see the version shipped in the docker image run the following command: ``docker run -i -t nginx:latest /usr/bin/njs -V``.
 
 Running inside Docker
 ---------------------
@@ -36,13 +36,9 @@ nginx compatibility
 -------------------
 As njs is a `native nginx module <http://nginx.org/en/docs/dev/development_guide.html#Modules>`_ its compatibility with nginx is high. While it is developed as a separate project, it is routinely tested with latest nginx versions on various platforms and architectures.
 
-Presentation at nginx.conf 2018
--------------------------------
-https://youtu.be/Jc_L6UffFOs
-
-Extending NGINX with Custom Code
---------------------------------
-https://youtu.be/0CVhq4AUU7M
+JavaScript engines
+-------------------
+njs can run on top of two JavaScript engines: the built-in njs engine and `QuickJS <https://bellard.org/quickjs/>`_. The engine is selected with the `js_engine <https://nginx.org/en/docs/http/ngx_http_js_module.html#js_engine>`_ directive (``js_engine njs;`` or ``js_engine qjs;``). QuickJS offers broader ECMAScript compatibility and is the recommended engine for new deployments. The examples in this repo work with both engines unless noted otherwise.
 
 Installation
 ------------
@@ -103,7 +99,7 @@ Checking:
   Hello world!
 
   curl http://localhost/version
-  0.4.1
+  1.0.0
 
 Access phase (``js_access``)
 ----------------------------
@@ -1097,7 +1093,7 @@ Checking:
   <head><title>401 Authorization Required</title></head>
   <body>
   <center><h1>401 Authorization Required</h1></center>
-  <hr><center>nginx/1.19.0</center>
+  <hr><center>nginx/1.29.0</center>
   </body>
   </html>
 
@@ -1106,7 +1102,7 @@ Checking:
   <head><title>401 Authorization Required</title></head>
   <body>
   <center><h1>401 Authorization Required</h1></center>
-  <hr><center>nginx/1.19.0</center>
+  <hr><center>nginx/1.29.0</center>
   </body>
   </html>
 
@@ -2392,7 +2388,7 @@ Command line interface
 
 .. code-block:: none
 
-    interactive njs 0.4.1
+    interactive njs 1.0.0
 
     v.<Tab> -> the properties and prototype methods of v.
 
@@ -2405,7 +2401,7 @@ Command line interface
       timeEnd: [Function: native]
      },
      njs: njs {
-      version: '0.4.1'
+      version: '1.0.0'
      },
      print: [Function: native],
      global: [Circular],
@@ -2417,11 +2413,11 @@ Command line interface
       env: {
        HOSTNAME: '483ac20bb33f',
        HOME: '/root',
-       PKG_RELEASE: '1~buster',
+       PKG_RELEASE: '1~bookworm',
        TERM: 'xterm',
-       NGINX_VERSION: '1.19.0',
+       NGINX_VERSION: '1.29.0',
        PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-       NJS_VERSION: '0.4.1',
+       NJS_VERSION: '1.0.0',
        PWD: '/'
       }
      }
